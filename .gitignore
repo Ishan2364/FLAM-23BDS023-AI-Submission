@@ -1,1 +1,4 @@
 venv
+.env
+partA/data/flores200_eval
+partA/data/*.tar.gz
