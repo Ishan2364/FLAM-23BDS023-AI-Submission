@@ -310,3 +310,96 @@ tam        3.359    0.1348        0.4292       53.79
 FLORES-200 is the primary/declared corpus for this assignment (A1). To confirm the FLORES-200 result above isn't an artifact of one particular data pull or HF access path, reran the identical `corrected_analysis.py` command against `partA/data/flores101_eval/` (the public, ungated tarball — kept in the repo specifically to make this cross-check reproducible without a gated HF token).
 
 Result: **numbers identical to the FLORES-200 run above, in every cell, all 3 tokenizers, all 4 denominators** (e.g. gpt2 tok/sentence: eng 26.78, hin 192.42, kan 350.85, tam 398.38 — matches to 2 decimal places on both corpora). This was expected per the A1 writeup: FLORES-200's dev split for eng/hin/kan/tam is built on the same underlying sentences as FLORES-101 for these languages. FLORES-101 serves its purpose here — an independent, reproducible confirmation that the FLORES-200 primary result holds — not as a second, separate finding. All A3 findings and the conclusion above are reported against FLORES-200 as the headline corpus, with FLORES-101 as corroborating support.
+
+# Part B — Capacity Reconciliation
+
+Source files: `starter_kit/bench/model_spec.md` (serving spec for FLM-4B-Instruct on 1x L4 24GB) and `bench_log.csv` (13-row load test log), copied untouched into `partB/data/` for a self-contained working copy.
+
+## 2026-07-19 — B1: KV-cache bytes/token and max concurrent sequences
+
+Built `partB/kv_cache_calc.py` — named, editable constants from `model_spec.md`, so the arithmetic can be re-derived live with different assumptions (e.g. a different GPU or utilization) without touching the formulas.
+
+**KV-cache bytes/token:**
+```
+2 (K and V) x 28 layers x 8 KV_heads x 128 head_dim x 2 bytes (fp16) = 114,688 bytes/token (112 KiB/token)
+```
+
+**Max concurrent 4096-token sequences:**
+```
+model weights = 4.2e9 params x 2 bytes (fp16) = 7.83 GiB
+usable GPU memory for KV cache = 24 GiB x 0.92 (gpu_memory_utilization) - 7.83 GiB (weights) - 1.6 GiB (overhead) = 12.66 GiB
+bytes per 4096-token sequence = 114,688 bytes/token x 4096 tokens = 469,762,048 bytes = 448 MiB
+max concurrent sequences = 12.66 GiB / 448 MiB ~= 28
+```
+
+**Cross-check against `bench_log.csv`**, rows with `prompt_len=3584, gen_len=512` (3584+512 = 4096 tokens total, matching the sequence length assumed above — these are exactly the rows to check):
+
+| batch | kv_cache_util | preempted_seqs |
+|---|---|---|
+| 4 | 0.16 | 0 |
+| 8 | 0.31 | 0 |
+| 16 | 0.62 | 0 |
+| 24 | 0.93 | 0 |
+| 32 | 0.97 | 7 |
+| 48 | 0.97 | 23 |
+
+**Verdict — prediction confirmed.** The predicted ceiling (~28 sequences) sits exactly in the transition zone the log shows: batch 24 is below the ceiling and has zero preemptions (system still has headroom, 93% KV util); batch 32 is above the ceiling and immediately shows preemption (7 sequences evicted); batch 48 (further above) shows even more (23 evicted). If the formula's ceiling were wrong — e.g. much lower or much higher than 28 — this clean "fine below it, breaks right above it" pattern wouldn't hold. Two independent sources (a formula derived only from the spec sheet, and a real measured load test) agree on where the system runs out of KV-cache room.
+
+## 2026-07-19 — B2: the long-context throughput anomaly
+
+Naive expectation: throughput (`reported_tok_s`) should keep rising as batch size rises. Looking at the `prompt_len=3584` rows, it does — up through batch 24 — then reverses.
+
+Built `partB/throughput_anomaly.py`: uses batch 24 (the last batch with zero preemptions) as a "no-contention" baseline (per-request rate = 1607.4 / 24 = 66.98 tok/s/request), projects what throughput *should* be at larger batches if that rate held with no contention, and compares to what was actually measured.
+
+```
+batch   tok/s   %chg vs prev   naive-projected   shortfall %   preempted
+4       565.4                  267.9             -111.0%       0
+8       902.6   +59.6%         535.8             -68.5%        0
+16      1311.4  +45.3%         1071.6            -22.4%        0
+24      1607.4  +22.6%         1607.4             0.0%         0
+32      1384.0  -13.9%         2143.2             35.4%        7
+48      1298.5  -6.2%          3214.8             59.6%        23
+```
+
+**Reading this:** below batch 24, actual throughput is *higher* than the naive per-request-rate projection (negative shortfall) — expected, since small batches don't saturate the GPU's parallelism, so each added request is nearly "free" and total throughput scales better than linearly. batch 24 is the sweet spot (0% shortfall by construction). Past batch 24, throughput doesn't just fail to keep scaling — it drops in absolute terms (-13.9% at batch 32, -19.2% cumulative by batch 48 vs. batch 24's peak), while the shortfall vs. naive projection balloons to 35.4% (batch 32) and 59.6% (batch 48).
+
+**Mechanism, using the specific rows/columns:** `kv_cache_util` hits 0.97 (essentially full) exactly at batch 32, and `preempted_seqs` goes from 0 (batch 24) to 7 (batch 32) to 23 (batch 48) — see B1's table. Once the KV cache is full, the scheduler can't just hold more sequences: it has to preempt (evict) some mid-generation to free room, then resume them later. That eviction/resume cycle burns time without producing new output tokens, so wall-clock time grows faster than useful work does — which is exactly why throughput falls even as `num_requests` rises. This is the same root cause identified in B1 (GPU out of KV-cache room), now shown to directly cause a measurable throughput regression, not just a capacity ceiling.
+
+**Proposed fix:** cap admission at batch size ≤24 for ~4096-token-long requests (admission control keyed off predicted KV-cache usage, not just queue depth) — reject/queue excess requests instead of overcommitting and thrashing. **Predicted quantitative effect:** sustaining batch 24's 1607.4 tok/s instead of degrading to batch 48's 1298.5 tok/s — a **~19.2% throughput improvement** by refusing to over-admit past the point where preemption starts, using already-measured numbers from this log (not a new experiment, a comparison of measured before/after batch sizes).
+
+## 2026-07-19 — B3: the goodput correction
+
+REPORT_v0 Section 2 claims (a) longer prompts give better throughput, and (b) batch 48 will deliver ~3200 tok/s. Both trace to the same misread column: `reported_tok_s`.
+
+Built `partB/goodput_calc.py`. First confirms the hypothesis on the batch=24, prompt_len=3584 row:
+
+```
+(prompt_len + gen_len) * num_requests / wall_clock_s = (3584+512) * 24 / 61.16 = 1607.3
+reported_tok_s from log                                                       = 1607.4
+=> MATCHES
+```
+
+`reported_tok_s` is literally `(prompt tokens + generated tokens) / wall_clock_s` — it counts the ~3584 prompt tokens (read in one cheap parallel prefill pass) as if they were generated one-by-one at the same rate as the 512 actually-generated tokens. Long prompts get to "count" thousands of nearly-free tokens toward the throughput number, which is exactly why longer prompts *looked* faster.
+
+**Honest goodput, two independent derivations, same row (batch=24, prompt_len=3584):**
+
+*Method 1 — generated tokens only, over wall clock:*
+```
+gen_len * num_requests / wall_clock_s = 512 * 24 / 61.16 = 200.9 tok/s
+```
+
+*Method 2 — from decode-phase per-token latency (`itl_ms_p50`):*
+```
+per-request rate = 1000 / 96.07 = 10.409 tok/s/request
+goodput = 10.409 * 24 = 249.8 tok/s
+```
+
+Both land in the same ballpark (~200-250 tok/s) despite being derived completely differently (one from total wall-clock time, one from steady-state per-token decode latency) — cross-validating each other. Compared to the reported 1607.4 tok/s, the log's number **overstates real generation throughput by ~613%**.
+
+**The batch-48 "~3200 tok/s" claim traces to the exact same bug, compounded with a naive linear-scaling assumption:** `1607.4 (batch 24's reported/blended tok/s) x 2 (batch doubling: 48/24=2) = 3214.8` — matching the report's "~3200" almost exactly. So the report didn't just misread one column once — it took the already-blended, misleading batch-24 number and naively doubled it for batch 48, ignoring that (per B1/B2) the GPU runs out of KV-cache room well before batch 48 and throughput *drops*, not doubles.
+
+**What the report should have said:** honest generation throughput at batch 24 is ~200-250 tok/s, not 1607 — the earlier number counted prompt-reading as if it were generation. Longer prompts don't give "better throughput"; they make the blended metric look better because more prefill tokens get folded into the same denominator. And batch 48 does not deliver ~3200 tok/s — per B2, real throughput at batch 48 is *lower* than at batch 24 (1298.5 vs 1607.4 reported, and honest goodput would be lower still), because the GPU is past its KV-cache capacity and thrashing on preemption, not scaling linearly.
+
+## 2026-07-19 — B4: confirming metric for the B2 mechanism
+
+`bench_log.csv` already contains the smoking-gun counter: `preempted_seqs`, which is 0 through batch 24 and jumps to 7 (batch 32) then 23 (batch 48) — exactly the batch sizes B1 predicted would exceed the ~28-sequence KV-cache ceiling. But `bench_log.csv` is a one-shot load-test log, not live telemetry — to confirm this mechanism is actually happening in a running production deployment (not just in this offline test), the metric to pull is the serving stack's own preemption counter: in a vLLM-style serving stack this is `num_preemptions_total` (a running Prometheus counter incremented every time the scheduler evicts a sequence to free KV-cache blocks), alongside `gpu_cache_usage_perc` (the live analogue of this log's `kv_cache_util`). Expected value: `num_preemptions_total` should stay flat at 0 while concurrent long-context (~4096-token) requests stay at or below ~24-28, then start climbing once concurrency exceeds that — mirroring the exact pattern already seen in `preempted_seqs` here (0 → 7 → 23), and any sustained climb in that counter alongside `gpu_cache_usage_perc` pinned near 1.0 would confirm the same KV-cache-exhaustion mechanism is recurring live, not just an artifact of this one test run.
