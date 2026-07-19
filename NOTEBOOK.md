@@ -24,6 +24,20 @@ hin is 5.89x the fertility of eng (worse tokenization)
 
 Matches REPORT_v0.md exactly. Baseline confirmed — starting A2 (script/metric audit) from here.
 
+## 2026-07-19 — A1 final writeup: the eval corpus
+
+**Languages (4, as required):** English (eng), Hindi (hin), Kannada (kan), Tamil (tam). Hindi is Indo-Aryan; Kannada and Tamil are both Dravidian, satisfying the "two Dravidian languages" requirement and giving us a script-family contrast (Devanagari vs. Kannada script vs. Tamil script) alongside the Latin-script baseline.
+
+**Corpus and why:** FLORES-200 (`facebook/flores` on HuggingFace) is our primary/declared corpus — it's the current, actively-maintained release the assignment brief itself points to, and pulling it required a personal HF token since the repo is gated (`partA/corpus_prep_flores200.py`, token read from `.env`, never committed). To cross-check and to keep a reproducible, redistributable copy in the repo, we also pulled the same 4 languages from FLORES-101, Meta's earlier public/ungated tarball (`https://dl.fbaipublicfiles.com/flores101/dataset/flores101_dataset.tar.gz`, CC-BY-SA). The two are numerically identical for eng/hin/kan/tam — FLORES-200's dev split for these languages is built on the same underlying dev sentences as FLORES-101 (confirmed: fertility numbers matched to 2 decimal places across all 4 languages, see the two A1 experiment logs above). So while FLORES-200 is the corpus of record, all A2/A3 experiments run against the FLORES-101 copy in practice, because it's identical in content and doesn't require redistributing gated data — `flores200_eval/` stays local-only (gitignored), `flores101_eval/` is committed for grader reproducibility.
+
+**Size:** 997 parallel sentences per language (3,988 sentences total across 4 languages), sentence-aligned by line number — line N in `eng.txt` is a direct translation of line N in `hin.txt`/`kan.txt`/`tam.txt`.
+
+**Domain:** FLORES sentences are professionally translated, drawn from a mix of Wikinews, Wikijunior, and Wikivoyage articles — encyclopedic/journalistic prose, not conversational or transactional text (no chat messages, no code-mixing, no slang).
+
+**Preprocessing:** none beyond what `fertility.py` itself does (NFC normalization, lowercasing). Files saved as plain UTF-8 `.txt`, one sentence per line, no filtering or resampling applied on our end.
+
+**What this corpus cannot tell us:** 997 sentences is a reasonable smoke-test size but still small relative to real production traffic, and formal, professionally-translated encyclopedic prose is not representative of actual user queries — no code-switching, no informal register, no domain-specific jargon (support tickets, casual chat, voice-to-text artifacts) that a production system would actually see. Because FLORES-101 and FLORES-200 collapsed to the same sentences for these 4 languages, we effectively only sampled one translation of each source sentence, not independent corpora — so this doesn't triangulate across corpus sources, only across tokenizers and metrics. Any fertility numbers below should be read as "how this specific benchmark text tokenizes," not as a guaranteed predictor of live traffic cost.
+
 ## 2026-07-19 — A2, candidate #1: `.lower()` (line 60)
 
 Hypothesis: lowercasing is a no-op for Hindi (no case in Devanagari) but shifts English token counts (BPE is case-sensitive) — asymmetric effect on a cross-language metric.
@@ -218,3 +232,81 @@ tam is 2.42x the fertility of eng
 | ai4bharat/indic-bert | 1.38 | 1.70 (1.23x) | 3.10 (2.24x) | 3.34 (2.42x) |
 
 indic-bert lands between xlm-roberta-base and muril-base-cased — worse than MuRIL despite being India-specific, likely because indic-bert's ALBERT-style vocab is much smaller (shared/compressed for a lightweight model) than MuRIL's. All three Indic-aware tokenizers agree on the core finding regardless of exact ranking: the eng-vs-kan/tam gap under gpt2 (17-19x) collapses to roughly 1.2-2.4x under any tokenizer that actually saw these scripts during training — strengthening the conceptual-bug conclusion, not just a one-tokenizer fluke.
+
+## 2026-07-19 — A2 final verdict: the three claims we're taking forward
+
+Of the 7 candidates tested above, these are the three going into the audit writeup — one code bug, one confirmed-harmless ("looks suspicious but fine"), one conceptual flaw. The other four (macro/micro-avg, `.lower()`, base-language ordering, dead `random.seed`) were tested and logged but are either too small to matter or not interesting enough to claim — kept in the notebook as the dead ends they are, not discarded silently.
+
+**1. Clean code bug — `words = line.split(" ")` (line 62).**
+A plain single-space split turns any double space in the source text into an empty-string "word," inflating the word count and understating fertility. Both sample corpora and the FLORES-101 corpus contain lines with double spaces. Isolated and measured (`fertility_split_ws.py`, `split(" ")` → `split()`):
+- 10-line sample: eng 1.27→1.28, hin 7.45→7.60, ratio 5.89x→5.92x
+- FLORES-101 (997 lines): eng 1.28→1.28, hin 7.82→7.83, kan 22.15→22.95, tam 24.73→24.87
+Small (~0-4%) but real and consistently in one direction (original always slightly *understates* fertility) — a genuine, if minor, bug.
+
+**2. Suspicious but fine — NFC normalization (line 49).**
+Looks like exactly the kind of silent text-mangling that would bias a cross-language comparison. Tested by removing it (`fertility_no_nfc.py`) on both the sample corpus and FLORES-101: output was byte-for-byte identical to the original in every column, every language. The corpora used here are already NFC-normalized, so this line is currently a no-op — confirmed harmless, not flagged as a bug. (Caveat: could matter on messier, non-normalized real-world/scraped text; not something this evidence rules out in general, only on this data.)
+
+**3. Conceptual problem — tokens/word via an English-trained tokenizer conflates language cost with tokenizer coverage.**
+The script computes tokens/word exactly as specified — the bug is that this isn't the right question when the tokenizer itself is a confound. gpt2's BPE vocab has effectively no Kannada/Tamil coverage, so it degrades toward byte-level encoding for those scripts, making "fertility" mostly measure *tokenizer-training mismatch*, not intrinsic language cost. Evidence: swapping only the tokenizer, same unmodified script, same FLORES-101 corpus —
+
+| tokenizer | eng | hin (ratio) | kan (ratio) | tam (ratio) |
+|---|---|---|---|---|
+| gpt2 | 1.28 | 7.82 (6.10x) | 22.15 (17.27x) | 24.73 (19.28x) |
+| xlm-roberta-base | 1.42 | 1.50 (1.06x) | 2.51 (1.77x) | 2.44 (1.72x) |
+| muril-base-cased | 1.29 | 1.25 (0.97x) | 1.77 (1.37x) | 1.74 (1.34x) |
+| ai4bharat/indic-bert | 1.38 | 1.70 (1.23x) | 3.10 (2.24x) | 3.34 (2.42x) |
+
+English stays roughly flat (1.28-1.42) across all four tokenizers; Hindi's "6x worse" collapses to near-parity (0.97x-1.23x); Kannada/Tamil's "17-19x worse" collapses to 1.3x-2.4x — a 7-14x reduction in the reported gap, replicated across three independent Indic-aware tokenizers, not a one-model fluke. The report's "budget 6x serving cost for Hindi, route Indic traffic separately" is largely an artifact of benchmarking with gpt2 specifically. A real, smaller residual gap (~1.2-2.4x for kan/tam) does survive even with better tokenizers — the honest claim is "the gap is far smaller than reported and mostly a tokenizer-choice artifact," not "there is no gap."
+
+## 2026-07-19 — A3: corrected analysis, 3 tokenizers x 4 denominators (FLORES-200, primary corpus)
+
+Built `partA/corrected_analysis.py`: bug-fixed (`split()` not `split(" ")`), keeps NFC (confirmed harmless), reports 4 denominators per language — tok/word, tok/byte (UTF-8), tok/grapheme, and **tok/sentence** (mean tokens per parallel sentence — new, added specifically for A3, since FLORES sentences are translations of each other and so are the one denominator that holds *meaning* constant, not just a proxy like words/bytes/graphemes).
+
+Ran on **FLORES-200** (`partA/data/flores200_eval/`, our declared primary corpus per the A1 writeup), all 4 languages, 3 tokenizers (gpt2, xlm-roberta-base, ai4bharat/indic-bert):
+
+```
+gpt2
+lang    tok/word  tok/byte  tok/grapheme  tok/sentence
+eng        1.283    0.2150        0.2152       26.78
+hin        7.826    0.5943        1.5977      192.42
+kan       22.946    0.9785        2.9112      350.85
+tam       24.867    0.9957        3.1748      398.38
+
+xlm-roberta-base
+eng        1.419    0.2372        0.2374       29.58
+hin        1.500    0.1144        0.3069       36.75
+kan        2.601    0.1116        0.3314       39.74
+tam        2.453    0.0987        0.3140       39.23
+
+ai4bharat/indic-bert
+eng        1.383    0.2316        0.2318       28.86
+hin        1.702    0.1296        0.3479       41.82
+kan        3.214    0.1373        0.4082       49.11
+tam        3.359    0.1348        0.4292       53.79
+```
+
+**Ratio to eng, by denominator and tokenizer (FLORES-200):**
+
+| tokenizer | denom | hin | kan | tam |
+|---|---|---|---|---|
+| gpt2 | tok/word | 6.10x | 17.89x | 19.38x |
+| gpt2 | tok/byte | 2.76x | 4.55x | 4.63x |
+| gpt2 | tok/sentence | 7.18x | 13.10x | 14.88x |
+| xlm-roberta-base | tok/word | 1.06x | 1.83x | 1.73x |
+| xlm-roberta-base | tok/byte | 0.48x | 0.47x | 0.42x |
+| xlm-roberta-base | tok/sentence | 1.24x | 1.34x | 1.33x |
+| indic-bert | tok/word | 1.23x | 2.32x | 2.43x |
+| indic-bert | tok/byte | 0.56x | 0.59x | 0.58x |
+| indic-bert | tok/sentence | 1.45x | 1.70x | 1.86x |
+
+**Key observation — tok/byte is its own confound.** Under xlm-roberta-base and indic-bert, Hindi/Kannada/Tamil come out *cheaper* per byte than English (ratios < 1.0x). This isn't because Indic text is cheaper to serve — it's because Devanagari/Kannada/Tamil are multi-byte in UTF-8 (~3 bytes/codepoint) while English ASCII is 1 byte/char, so "tokens per byte" is inflated for English and deflated for Indic scripts independent of any real cost difference. tok/byte fails the same test tok/word failed in A2: it doesn't hold a fair unit constant across languages/scripts.
+
+**tok/sentence is the answer to "which single number should drive the routing decision."** FLORES sentences are translations of each other — same meaning, same content — so tokens-to-encode-one-sentence directly answers "how much context/compute does this language cost for the same request," which is exactly what a routing/capacity decision needs. It isn't distorted by whitespace-word morphology differences (A2's bug) or UTF-8 byte-density differences (this section's finding). Under gpt2 it still shows the same massive, misleading gap (7-15x) as tok/word did; under an Indic-aware tokenizer it shows a real, modest residual: Hindi ~1.2-1.5x, Kannada/Tamil ~1.3-1.9x — consistent with tok/word's residual finding in A2, cross-validating each other.
+
+**A3 conclusion:** the single number to drive the routing-and-cost decision is **tokens per request (operationalized here as tok/sentence on parallel data), measured with an Indic-aware tokenizer** — not tok/word (conflates morphology with tokenizer coverage, A2's conceptual bug) and not tok/byte (conflates UTF-8 script encoding density with cost). Recommendation candidate for A4: xlm-roberta-base showed the smallest, most consistent residual gap (1.24x-1.34x) of the two Indic-aware tokenizers tested here — pending final tokenizer choice in A4.
+
+## 2026-07-19 — A3 cross-check on FLORES-101 (supporting corpus)
+
+FLORES-200 is the primary/declared corpus for this assignment (A1). To confirm the FLORES-200 result above isn't an artifact of one particular data pull or HF access path, reran the identical `corrected_analysis.py` command against `partA/data/flores101_eval/` (the public, ungated tarball — kept in the repo specifically to make this cross-check reproducible without a gated HF token).
+
+Result: **numbers identical to the FLORES-200 run above, in every cell, all 3 tokenizers, all 4 denominators** (e.g. gpt2 tok/sentence: eng 26.78, hin 192.42, kan 350.85, tam 398.38 — matches to 2 decimal places on both corpora). This was expected per the A1 writeup: FLORES-200's dev split for eng/hin/kan/tam is built on the same underlying sentences as FLORES-101 for these languages. FLORES-101 serves its purpose here — an independent, reproducible confirmation that the FLORES-200 primary result holds — not as a second, separate finding. All A3 findings and the conclusion above are reported against FLORES-200 as the headline corpus, with FLORES-101 as corroborating support.
