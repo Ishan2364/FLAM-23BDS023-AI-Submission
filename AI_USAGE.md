@@ -1,5 +1,7 @@
 # AI Usage
 
+Before any of the work below, I used Claude to help me understand the starter kit itself — walking through `fertility.py`, `REPORT_v0.md`, `model_spec.md`, and `bench_log.csv` line by line, and breaking down what each part of the assignment (A1-A4, B1-B4, C) was actually asking for. That orientation pass is why the plan below made sense to follow, rather than something I had to reverse-engineer from the assignment PDF alone.
+
 Used Claude throughout — for setup, scripting, running/interpreting experiments, and drafting. I directed which experiments to run and what to test next; every number in this submission was actually executed and pasted back by me before being accepted, not taken on Claude's word.
 
 ## Part A — tokenizer audit

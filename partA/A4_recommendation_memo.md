@@ -8,8 +8,9 @@ REPORT_v0's "Hindi costs 6x, route all Indic traffic separately" was measured wi
 |---|---|---|---|
 | gpt2 (original report) | 7.18x | 13.10x | 14.88x |
 | xlm-roberta-base (corrected) | **1.24x** | **1.34x** | **1.33x** |
+| ai4bharat/indic-bert (corrected) | 1.45x | 1.70x | 1.86x |
 
-The reported 6-19x gap collapses to a real but modest 1.2-1.3x once the tokenizer actually has Indic-script coverage. Confirmed independently across two more Indic-aware tokenizers (muril-base-cased, ai4bharat/indic-bert) and two corpora (FLORES-200 primary, FLORES-101 cross-check) — not a one-tokenizer fluke.
+The reported 6-19x gap collapses to a real but modest ~1.2-1.9x once the tokenizer actually has Indic-script coverage — confirmed on two independent Indic-aware tokenizers, not a one-tokenizer fluke, and cross-checked on two corpora (FLORES-200 primary, FLORES-101 cross-check). (A separate tok/word-only test in A2 also included muril-base-cased, which showed the same collapse — but muril wasn't run through the full tok/sentence analysis here, so it's not in this table.)
 
 **Why tokens/sentence, not tokens/word or tokens/byte:** tokens/word (the original metric) conflates language cost with tokenizer training coverage — that's the report's core conceptual bug. tokens/byte looked like a fix but has its own confound: Devanagari/Kannada/Tamil are ~3 bytes/codepoint in UTF-8 vs. English's 1 byte/char, so it systematically favors Indic scripts regardless of real cost. Tokens per *parallel sentence* (same meaning, same content, different language) is the one denominator that holds the actual unit of value constant, and it's what determines real context/compute usage per request.
 
@@ -21,7 +22,7 @@ The reported 6-19x gap collapses to a real but modest 1.2-1.3x once the tokenize
 
 ## Biggest caveat
 
-FLORES is professionally-translated encyclopedic/news prose (Wikinews/Wikijunior/Wikivoyage) — 997 sentences, no code-switching, no informal register, no production-traffic patterns (chat, slang, mixed-script input). The 1.2-1.3x residual gap is measured on this benchmark text; real user traffic could shift it in either direction, and this analysis cannot rule that out. Treat 1.2-1.3x as a benchmark-grounded estimate to validate against live traffic, not a guarantee.
+FLORES is professionally-translated encyclopedic/news prose (Wikinews/Wikijunior/Wikivoyage) — 997 sentences, no code-switching, no informal register, no production-traffic patterns (chat, slang, mixed-script input). The measured residual gap (1.2-1.3x with xlm-roberta-base, up to ~1.9x with indic-bert — both far below gpt2's 6-19x) is measured on this benchmark text; real user traffic could shift it in either direction, and this analysis cannot rule that out. Treat these ratios as a benchmark-grounded estimate to validate against live traffic, not a guarantee.
 
 ## Production metric to monitor
 
